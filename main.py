@@ -2,13 +2,19 @@ import argparse
 import random
 import os
 import time
+
 import torch
 import numpy as np
+from sklearn.metrics import precision_score, recall_score
+
 from dataset import EarthquakeDataset, MyAug
-from model import MODEL_MM, MODEL_SAR, MODEL_OPT
+from model import M3ICNet, MODEL_MM, MODEL_SAR, MODEL_OPT
 from metrics import compute_imagewise_retrieval_metrics, compute_imagewise_f1_metrics
 
-torch.autograd.set_detect_anomaly(True)
+# speedups
+torch.backends.cudnn.benchmark = True
+torch.cuda.empty_cache()
+
 torch.manual_seed(42)
 random.seed(42)
 np.random.seed(42)
@@ -16,180 +22,153 @@ np.random.seed(42)
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch_size", default=32, type=int)
 parser.add_argument("--epochs", default=30, type=int)
-parser.add_argument("--num_workers", default=8, type=int)
-parser.add_argument("--lr", default=1e-4, type=float)
-parser.add_argument("--root", default='data', type=str)
-parser.add_argument("--val_split", default='fold-1.txt', type=str)
-parser.add_argument("--checkpoints", default='checkpoints_all/fold1', type=str)
+parser.add_argument("--num_workers", default=4, type=int)
+parser.add_argument("--lr", default=3e-5, type=float)
+parser.add_argument("--weight_decay", default=1e-4, type=float)
+parser.add_argument("--root", default="data", type=str)
+parser.add_argument("--val_split", default="fold-1.txt", type=str)
+parser.add_argument("--checkpoints", default="checkpoints_all/fold1", type=str)
 parser.add_argument("--sar_pretrain", default=None, type=str)
 parser.add_argument("--opt_pretrain", default=None, type=str)
-parser.add_argument("--mode", default='all', type=str, choices=['all','sar','opt'])
-parser.add_argument("--use_shadow", action="store_true", help="Use shadow-enhanced optical image")
+parser.add_argument("--use_shadow", action="store_true")
+parser.add_argument("--model_type", default="m3ic", choices=["m3ic","all","sar","opt"])
+args = parser.parse_args()
 
-if __name__ == '__main__':
-    args = parser.parse_args()
-    
-    # Define the device to use (GPU if available, else CPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # create dataset and dataloader
-    if 'fold-1.txt' == args.val_split:
-        train_splits = ['fold-2.txt','fold-3.txt','fold-4.txt','fold-5.txt']
-        val_split = ['fold-1.txt']
-    elif 'fold-2.txt' == args.val_split:
-        train_splits = ['fold-1.txt','fold-3.txt','fold-4.txt','fold-5.txt']
-        val_split = ['fold-2.txt']
-    elif 'fold-3.txt' == args.val_split:
-        train_splits = ['fold-1.txt','fold-2.txt','fold-4.txt','fold-5.txt']
-        val_split = ['fold-3.txt']
-    elif 'fold-4.txt' == args.val_split:
-        train_splits = ['fold-1.txt','fold-2.txt','fold-3.txt','fold-5.txt']
-        val_split = ['fold-4.txt']
-    elif 'fold-5.txt' == args.val_split:
-        train_splits = ['fold-1.txt','fold-2.txt','fold-3.txt','fold-4.txt']
-        val_split = ['fold-5.txt']
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_dataset = EarthquakeDataset(args.root, train_splits)
-    val_dataset = EarthquakeDataset(args.root, val_split)
+# prepare splits
+folds = [f"fold-{i}.txt" for i in range(1,6)]
+train_splits = [f for f in folds if f != args.val_split]
+val_splits   = [args.val_split]
 
-    print(len(train_dataset), len(val_dataset))
+train_ds = EarthquakeDataset(args.root, train_splits)
+val_ds   = EarthquakeDataset(args.root, val_splits)
+print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
-    # class weighted data sampler
-    y_train = train_dataset.labels
-    class_sample_count = np.array([len(np.where(y_train == t)[0]) for t in np.unique(y_train)])
-    weight = 1. / class_sample_count
-    samples_weight = np.array([weight[t] for t in y_train])
-    sampler = torch.utils.data.sampler.WeightedRandomSampler(samples_weight, len(samples_weight))
+# weighted sampler
+y = train_ds.labels
+counts = np.array([np.sum(y == t) for t in np.unique(y)])
+weights = 1.0 / counts
+sample_weights = np.array([weights[t] for t in y])
+sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights))
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        num_workers=args.num_workers, 
-        sampler=sampler, 
-        pin_memory=True, 
-        drop_last=True
+train_loader = torch.utils.data.DataLoader(
+    train_ds, batch_size=args.batch_size, sampler=sampler,
+    num_workers=args.num_workers, pin_memory=True, drop_last=True
+)
+val_loader = torch.utils.data.DataLoader(
+    val_ds, batch_size=1, shuffle=False,
+    num_workers=args.num_workers, pin_memory=True
+)
+
+# select model
+if args.model_type == "m3ic":
+    model = M3ICNet(
+        sar_pretrain=args.sar_pretrain,
+        opt_pretrain=args.opt_pretrain,
+        use_shadow=args.use_shadow
     )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, 
-        batch_size=1, 
-        num_workers=args.num_workers, 
-        shuffle=False, 
-        pin_memory=True, 
-        drop_last=False
-    )
+elif args.model_type == "sar":
+    model = MODEL_SAR(args.sar_pretrain)
+elif args.model_type == "opt":
+    model = MODEL_OPT(args.opt_pretrain, use_shadow=args.use_shadow)
+else:
+    model = MODEL_MM(args.sar_pretrain, args.opt_pretrain, use_shadow=args.use_shadow)
+model = model.to(device)
 
-    ## create model, criterion, optimizer, scheduler
-    if args.mode == 'sar':
-        model = MODEL_SAR(args.sar_pretrain)
-    elif args.mode == 'opt':
-        model = MODEL_OPT(args.opt_pretrain, use_shadow=args.use_shadow)
-    elif args.mode == 'all':
-        model = MODEL_MM(args.sar_pretrain, args.opt_pretrain, use_shadow=args.use_shadow)
-    model = model.to(device)
+criterion = torch.nn.BCEWithLogitsLoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    criterion = torch.nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+augment = MyAug().to(device)
+os.makedirs(args.checkpoints, exist_ok=True)
 
-    ## define augmentation
-    common_aug = MyAug().to(device)
+# track best by F1
+best_f1            = 0.0
+best_auroc_at_f1   = 0.0
+best_epoch         = 0
+start = time.time()
 
-    ## training loop
-    os.makedirs(args.checkpoints, exist_ok=True)
-    start_time = time.time()
-    best_f1 = 0
-    best_auroc = 0
-    best_epoch = 0
+for epoch in range(args.epochs):
+    model.train()
+    running_loss = 0.0
+    for i, (images, labels) in enumerate(train_loader):
+        labels = labels.to(device)
+        sar    = images["sar"].to(device)
+        sarftp = images["sarftp"].to(device)
+        key    = "opt_with_shadow" if args.use_shadow else "opt"
+        opt    = images[key].to(device)
+        optftp = images["optftp"].to(device)
 
+        sar, sarftp, opt, optftp = augment(sar, sarftp, opt, optftp)
 
-    for epoch in range(args.epochs):
-        # training
-        model.train()
-        train_loss = 0
-        count = 0
-        for i, data in enumerate(train_loader, 0):
+        optimizer.zero_grad()
+        if args.model_type == "sar":
+            out = model(sar, sarftp)
+        elif args.model_type == "opt":
+            out = model(opt, optftp)
+        else:
+            out = model(sar, sarftp, opt, optftp)
+        loss = criterion(out.squeeze(1), labels.float())
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
 
-            images = data[0]
-            labels = data[1].to(device)
-            # Move images to device
-            sar = images['sar'].to(device)
-            sarftp = images['sarftp'].to(device)
+        if i % 10 == 0:
+            print(f"Epoch {epoch} Step {i} Loss {loss.item():.4f}")
 
-            # print(f"[DEBUG MAIN, TRAINING] args.use_shadow = {args.use_shadow}")
-            if args.use_shadow:
-                opt = images['opt_with_shadow']
+    scheduler.step()
+
+    # validation
+    model.eval()
+    all_out, all_gt = [], []
+    with torch.no_grad():
+        for images, labels in val_loader:
+            labels = labels.to(device)
+            sar    = images["sar"].to(device)
+            sarftp = images["sarftp"].to(device)
+            opt    = images[key].to(device)
+            optftp = images["optftp"].to(device)
+            if args.model_type == "sar":
+                out = model(sar, sarftp)
+            elif args.model_type == "opt":
+                out = model(opt, optftp)
             else:
-                opt = images['opt']
-            opt = opt.to(device)
-            # print(f"[Train] opt shape: {opt.shape}")  # should be [batch_size, 4, H, W] when using shadow
+                out = model(sar, sarftp, opt, optftp)
+            all_out.append(out.squeeze(1).cpu())
+            all_gt.append(labels.cpu())
 
-            optftp = images['optftp'].to(device)
-            
-            # Apply augmentation
-            sar, sarftp, _, _ = common_aug(sar, sarftp, opt, optftp)  # only augment sar
-            # print("[Augmented Train] opt shape:", opt.shape)
+    all_out = torch.sigmoid(torch.cat(all_out))
+    all_gt  = torch.cat(all_gt)
+    val_loss = criterion(all_out, all_gt.float()).item()
+    f1_metrics = compute_imagewise_f1_metrics(all_out.numpy(), all_gt.numpy())
+    au_metrics = compute_imagewise_retrieval_metrics(all_out.numpy(), all_gt.numpy())
 
-            optimizer.zero_grad()
-            if args.mode == 'sar':
-                outputs = model(sar, sarftp)
-            elif args.mode == 'opt':
-                outputs = model(opt, optftp)
-            elif args.mode == 'all':
-                outputs = model(sar, sarftp, opt, optftp)
-            loss = criterion(outputs.squeeze(1), labels.float())
-            loss.backward()
-            optimizer.step()
-            count += 1
-            train_loss += loss.item()
-            if i % 10 == 0:
-                print(args.val_split, epoch, i, loss.item())
-        
-        # validation
-        model.eval()
-        out_all = []
-        gt_all = []
-        for i, data in enumerate(val_loader, 0):
-            images = data[0]
-            labels = data[1].to(device)
-            sar = images['sar'].to(device)
-            sarftp = images['sarftp'].to(device)
+    epoch_f1 = f1_metrics["best_f1"]
+    epoch_au = au_metrics["auroc"]
+    thresh   = f1_metrics["best_threshold"]
 
-            # print(f"[DEBUG MAIN, VAL] args.use_shadow = {args.use_shadow}")
-            if args.use_shadow:
-                opt = images['opt_with_shadow'].to(device)
-            else:
-                opt = images['opt'].to(device)
-            # print(f"[Val] opt shape: {opt.shape}")
+    preds    = (all_out.numpy() >= thresh).astype(int)
+    gts      = all_gt.numpy().astype(int)
+    precision = precision_score(gts, preds)
+    recall    = recall_score(gts, preds)
 
-            optftp = images['optftp'].to(device)
-            outputs = model(sar, sarftp, opt, optftp)
-            out_all.append(outputs.detach().cpu())
-            gt_all.append(labels.detach().cpu())
-        out_all = torch.cat(out_all, 0).squeeze(1)
-        gt_all = torch.cat(gt_all, 0)
-        loss = criterion(out_all, gt_all.float()).item()
-        out_all = torch.nn.Sigmoid()(out_all)
+    print(f"Epoch {epoch} "
+          f"TrainLoss {running_loss/len(train_loader):.4f} "
+          f"ValLoss {val_loss:.4f} "
+          f"AUROC {epoch_au:.4f} "
+          f"F1 {epoch_f1:.4f} "
+          f"Prec {precision:.4f} "
+          f"Rec {recall:.4f} "
+          f"Thr {thresh:.2f}")
 
-        f1_metrics = compute_imagewise_f1_metrics(out_all.numpy(), gt_all.numpy())
-        auroc = compute_imagewise_retrieval_metrics(out_all.numpy(), gt_all.numpy())
-        
-        print(args.val_split, 'Epoch', epoch,
-              'train loss {:.4f}'.format(train_loss / count),
-              'val loss {:.4f}'.format(loss),
-              'auroc', auroc['auroc'],
-              'f1', f1_metrics['f1'],
-              'precision', f1_metrics['precision'],
-              'recall', f1_metrics['recall'],
-              'best_f1', f1_metrics['best_f1'],
-              'precision', f1_metrics['best_f1_precision'],
-              'recall', f1_metrics['best_f1_recall'],
-              'threshold', f1_metrics['best_threshold']
-        )
-        
-        if auroc['auroc'] > best_auroc:
-            best_f1 = f1_metrics['best_f1']
-            best_auroc = auroc['auroc']
-            best_epoch = epoch
-            torch.save(model.state_dict(), os.path.join(args.checkpoints, "checkpoint_ep{:02d}.pth".format(epoch)))
-            
-    print(args.val_split, 'best epoch', best_epoch, 'best_f1', best_f1, 'best_auroc', best_auroc, 'time', time.time() - start_time)
+    # save if this epoch has better F1
+    if epoch_f1 > best_f1:
+        best_f1          = epoch_f1
+        best_auroc_at_f1 = epoch_au
+        best_epoch       = epoch
+        ckpt_path        = os.path.join(args.checkpoints, f"checkpoint_ep{epoch:02d}.pth")
+        torch.save(model.state_dict(), ckpt_path)
+
+elapsed = time.time() - start
+print(f"Best Epoch {best_epoch} F1 {best_f1:.4f} AUROC {best_auroc_at_f1:.4f} Time {elapsed:.1f}s")

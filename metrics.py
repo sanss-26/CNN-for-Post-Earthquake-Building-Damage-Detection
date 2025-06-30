@@ -22,6 +22,7 @@ def compute_imagewise_retrieval_metrics(
     )
     return {"auroc": auroc, "fpr": fpr, "tpr": tpr, "threshold": thresholds}
     
+    
 def compute_imagewise_f1_metrics(anomaly_prediction_weights, anomaly_ground_truth_labels):
 
     y_pred = np.rint(anomaly_prediction_weights)
